@@ -135,6 +135,9 @@ pub trait LayoutElement {
     /// Unique ID of this element.
     fn id(&self) -> &Self::Id;
 
+    /// Unique ID of this element as a `u64` for use in IPC messages.
+    fn ipc_id(&self) -> u64;
+
     /// Updates the config for the element.
     fn update_config(&mut self, blur_config: niri_config::Blur) {
         let _ = blur_config;
@@ -2245,6 +2248,47 @@ impl<W: LayoutElement> Layout<W> {
         };
         workspace.center_column();
     }
+
+
+    pub fn workspace_layout_tree(
+        &self,
+        workspace_id: Option<u64>,
+    ) -> Option<niri_ipc::WorkspaceLayoutTree> {
+        if let Some(id) = workspace_id {
+            self.workspaces()
+                .find(|(_, _, ws)| ws.id().get() == id)
+                .map(|(_, _, ws)| ws.layout_tree())
+        } else {
+            self.active_workspace().map(|ws| ws.layout_tree())
+        }
+    }
+
+    pub fn apply_workspace_layout_tree(
+        &mut self,
+        workspace_id: Option<u64>,
+        layout: niri_ipc::WorkspaceLayoutTree,
+    ) -> Result<(), String> {
+        if let Some(InteractiveMoveState::Moving(_)) | Some(InteractiveMoveState::Starting { .. }) =
+            &self.interactive_move
+        {
+            return Err(
+                "cannot apply workspace layout while an interactive window move is in progress"
+                    .into(),
+            );
+        }
+
+        let ws = if let Some(id) = workspace_id {
+            self.workspaces_mut()
+                .find(|ws| ws.id().get() == id)
+                .ok_or_else(|| format!("workspace {} not found", id))?
+        } else {
+            self.active_workspace_mut()
+                .ok_or_else(|| "no active workspace".to_string())?
+        };
+
+        ws.apply_layout_tree(layout)
+    }
+
 
     pub fn center_window(&mut self, id: Option<&W::Id>) {
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {

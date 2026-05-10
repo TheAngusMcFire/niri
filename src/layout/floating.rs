@@ -324,6 +324,48 @@ impl<W: LayoutElement> FloatingSpace<W> {
         })
     }
 
+    pub fn layout_tree(&self) -> Vec<niri_ipc::FloatingWindowEntry> {
+        let scale = self.scale;
+        self.tiles_with_offsets()
+            .map(|(tile, offset)| {
+                let pos = offset.to_physical_precise_round(scale).to_logical(scale);
+                niri_ipc::FloatingWindowEntry {
+                    window_id: tile.window().ipc_id(),
+                    position: pos.into(),
+                }
+            })
+            .collect()
+    }
+
+    pub fn drain_tiles(&mut self) -> Vec<Tile<W>> {
+        self.interactive_resize = None;
+        self.closing_windows.clear();
+        self.active_window_id = None;
+
+        let tiles: Vec<_> = self.tiles.drain(..).collect();
+        self.data.clear();
+        tiles
+    }
+
+    pub fn rebuild_from_tiles(
+        &mut self,
+        tile_map: &mut std::collections::HashMap<u64, Tile<W>>,
+        entries: &[niri_ipc::FloatingWindowEntry],
+    ) {
+        for entry in entries {
+            let mut tile = tile_map.remove(&entry.window_id).unwrap();
+            tile.update_config(self.view_size, self.scale, self.options.clone());
+            let pos = Point::from(entry.position);
+            let data = Data::new(self.working_area, &tile, pos);
+            self.tiles.push(tile);
+            self.data.push(data);
+        }
+
+        if let Some(first) = self.tiles.first() {
+            self.active_window_id = Some(first.window().id().clone());
+        }
+    }
+
     pub fn tiles_with_ipc_layouts(&self) -> impl Iterator<Item = (&Tile<W>, WindowLayout)> {
         let scale = self.scale;
         self.tiles_with_offsets().map(move |(tile, offset)| {

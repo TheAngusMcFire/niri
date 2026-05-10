@@ -1609,6 +1609,127 @@ impl<W: LayoutElement> Workspace<W> {
         floating.chain(scrolling)
     }
 
+    pub fn layout_tree(&self) -> niri_ipc::WorkspaceLayoutTree {
+        let (columns, active_column_idx) = self.scrolling.layout_tree();
+        let floating = self.floating.layout_tree();
+        niri_ipc::WorkspaceLayoutTree {
+            workspace_id: self.id.get(),
+            columns,
+            active_column_idx,
+            floating,
+        }
+    }
+
+    pub fn apply_layout_tree(
+        &mut self,
+        layout: niri_ipc::WorkspaceLayoutTree,
+    ) -> Result<(), String> {
+        use std::collections::{HashMap, HashSet};
+
+        // Build a set of all current window IDs on this workspace.
+        let all_ids: HashSet<u64> = self
+            .windows()
+            .map(|w| w.ipc_id())
+            .collect();
+
+        // Validate the submitted layout.
+        let mut seen_ids: HashSet<u64> = HashSet::new();
+        for col in &layout.columns {
+            if col.windows.is_empty() {
+                return Err("a column in the submitted layout has no windows".into());
+            }
+            match col.width {
+                niri_ipc::ColumnWidthLayout::Proportion(p) if p <= 0. => {
+                    return Err("column width Proportion must be positive".into());
+                }
+                niri_ipc::ColumnWidthLayout::Fixed(f) if f <= 0. => {
+                    return Err("column width Fixed must be positive".into());
+                }
+                _ => {}
+            }
+            for win in &col.windows {
+                if !seen_ids.insert(win.window_id) {
+                    return Err(format!(
+                        "window id {} appears more than once in the layout",
+                        win.window_id
+                    ));
+                }
+                if !all_ids.contains(&win.window_id) {
+                    return Err(format!(
+                        "window {} is not on workspace {}",
+                        win.window_id,
+                        self.id.get()
+                    ));
+                }
+                match win.height {
+                    niri_ipc::ColumnWindowHeight::Auto { weight } if weight <= 0. => {
+                        return Err(format!(
+                            "window {} Auto height weight must be positive",
+                            win.window_id
+                        ));
+                    }
+                    niri_ipc::ColumnWindowHeight::Fixed(h) if h <= 0. => {
+                        return Err(format!(
+                            "window {} Fixed height must be positive",
+                            win.window_id
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for entry in &layout.floating {
+            if !seen_ids.insert(entry.window_id) {
+                return Err(format!(
+                    "window id {} appears more than once in the layout",
+                    entry.window_id
+                ));
+            }
+            if !all_ids.contains(&entry.window_id) {
+                return Err(format!(
+                    "window {} is not on workspace {}",
+                    entry.window_id,
+                    self.id.get()
+                ));
+            }
+        }
+        for id in &all_ids {
+            if !seen_ids.contains(id) {
+                return Err(format!(
+                    "window {} is on the workspace but missing from the submitted layout",
+                    id
+                ));
+            }
+        }
+
+        // Extract all tiles from both spaces into a flat map.
+        let mut tile_map: HashMap<u64, Tile<W>> = HashMap::new();
+        for tile in self.scrolling.drain_tiles() {
+            tile_map.insert(tile.window().ipc_id(), tile);
+        }
+        for tile in self.floating.drain_tiles() {
+            tile_map.insert(tile.window().ipc_id(), tile);
+        }
+
+        // Rebuild from the submitted layout.
+        self.scrolling
+            .rebuild_from_tiles(&mut tile_map, &layout.columns, layout.active_column_idx);
+        self.floating
+            .rebuild_from_tiles(&mut tile_map, &layout.floating);
+
+        // Maintain the floating_is_active invariant after the rebuild.
+        if self.floating.is_empty() {
+            self.floating_is_active = FloatingActive::No;
+        } else if self.scrolling.is_empty() {
+            self.floating_is_active = FloatingActive::Yes;
+        } else {
+            // Both spaces have windows: keep tiling focused as the safe default.
+            self.floating_is_active = FloatingActive::No;
+        }
+
+        Ok(())
+    }
+
     pub fn active_window_visual_rectangle(&self) -> Option<Rectangle<f64, Logical>> {
         if self.floating_is_active.get() {
             self.floating.active_window_visual_rectangle()

@@ -119,6 +119,27 @@ pub enum Request {
     OverviewState,
     /// Request information about screencasts.
     Casts,
+    /// Request the layout tree of a workspace.
+    ///
+    /// Returns a [`Response::WorkspaceLayout`] with the full column/floating layout.
+    WorkspaceLayout {
+        /// Id of the workspace to query.
+        ///
+        /// If `None`, uses the focused workspace.
+        workspace_id: Option<u64>,
+    },
+    /// Apply a layout tree to a workspace.
+    ///
+    /// Rearranges windows on the workspace to match the submitted tree. All windows currently on
+    /// the workspace must be present in the tree exactly once — none may be added or removed.
+    ApplyWorkspaceLayout {
+        /// Id of the workspace to modify.
+        ///
+        /// If `None`, uses the focused workspace.
+        workspace_id: Option<u64>,
+        /// The layout to apply.
+        layout: WorkspaceLayoutTree,
+    },
 }
 
 /// Reply from niri to client.
@@ -165,6 +186,8 @@ pub enum Response {
     OverviewState(Overview),
     /// Information about screencasts.
     Casts(Vec<Cast>),
+    /// The layout tree of a workspace.
+    WorkspaceLayout(WorkspaceLayoutTree),
 }
 
 /// Overview information.
@@ -181,6 +204,81 @@ pub struct Overview {
 pub struct PickedColor {
     /// Color values as red, green, blue, each ranging from 0.0 to 1.0.
     pub rgb: [f64; 3],
+}
+
+/// Full layout tree of a workspace, covering both tiling and floating windows.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct WorkspaceLayoutTree {
+    /// Unique id of the workspace this layout belongs to.
+    pub workspace_id: u64,
+    /// Columns of the scrolling (tiling) layout, in left-to-right order.
+    pub columns: Vec<WorkspaceColumn>,
+    /// Index of the currently active column (0-based). 0 when there are no columns.
+    pub active_column_idx: usize,
+    /// Floating windows in bottom-to-top stacking order.
+    pub floating: Vec<FloatingWindowEntry>,
+}
+
+/// A column in the tiling layout.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct WorkspaceColumn {
+    /// Tiles (windows) stacked in this column, top to bottom.
+    pub windows: Vec<ColumnWindow>,
+    /// Index of the active (focused) window within this column (0-based).
+    pub active_window_idx: usize,
+    /// Desired width of this column.
+    pub width: ColumnWidthLayout,
+    /// Whether this column spans the full working-area width.
+    pub is_full_width: bool,
+    /// How windows are arranged inside this column.
+    pub display: ColumnDisplay,
+}
+
+/// Desired width of a tiling column.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum ColumnWidthLayout {
+    /// A proportion of the working-area width (e.g. `0.5` = 50 %).
+    Proportion(f64),
+    /// A fixed width in logical pixels.
+    Fixed(f64),
+}
+
+/// A window tile within a tiling column.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct ColumnWindow {
+    /// Unique id of the window occupying this tile.
+    pub window_id: u64,
+    /// Desired height of this tile.
+    pub height: ColumnWindowHeight,
+}
+
+/// Desired height of a window tile within a column.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum ColumnWindowHeight {
+    /// Automatically distributed height, weighted among other `Auto` tiles in the column.
+    Auto {
+        /// Relative weight. Larger values take proportionally more vertical space.
+        weight: f64,
+    },
+    /// Fixed window height in logical pixels (excludes tile decorations).
+    Fixed(f64),
+}
+
+/// A floating window entry in the workspace layout.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct FloatingWindowEntry {
+    /// Unique id of the window.
+    pub window_id: u64,
+    /// Position of the tile (including borders) in workspace-view logical pixels.
+    ///
+    /// Corresponds to `WindowLayout::tile_pos_in_workspace_view`.
+    pub position: (f64, f64),
 }
 
 /// Actions that niri can perform.

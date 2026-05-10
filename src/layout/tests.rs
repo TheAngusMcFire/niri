@@ -15,6 +15,7 @@ use super::*;
 
 mod animations;
 mod fullscreen;
+mod workspace_layout;
 
 impl<W: LayoutElement> Default for Layout<W> {
     fn default() -> Self {
@@ -154,6 +155,10 @@ impl LayoutElement for TestWindow {
 
     fn id(&self) -> &Self::Id {
         &self.0.id
+    }
+
+    fn ipc_id(&self) -> u64 {
+        self.0.id as u64
     }
 
     fn size(&self) -> Size<i32, Logical> {

@@ -455,6 +455,44 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let casts = state.casts.casts.values().cloned().collect();
             Response::Casts(casts)
         }
+        Request::WorkspaceLayout { workspace_id } => {
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let tree = state.niri.layout.workspace_layout_tree(workspace_id);
+                let _ = tx.send_blocking(tree);
+            });
+            let tree = rx
+                .recv()
+                .await
+                .map_err(|_| String::from("error getting workspace layout tree"))?;
+            match tree {
+                Some(tree) => Response::WorkspaceLayout(tree),
+                None => return Err(String::from("workspace not found")),
+            }
+        }
+        Request::ApplyWorkspaceLayout {
+            workspace_id,
+            layout,
+        } => {
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                state.niri.advance_animations();
+                let result = state
+                    .niri
+                    .layout
+                    .apply_workspace_layout_tree(workspace_id, layout);
+                if result.is_ok() {
+                    state.niri.queue_redraw_all();
+                }
+                let _ = tx.send_blocking(result);
+            });
+            let result = rx
+                .recv()
+                .await
+                .map_err(|_| String::from("error applying workspace layout tree"))?;
+            result?;
+            Response::Handled
+        }
     };
 
     Ok(response)

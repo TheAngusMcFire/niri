@@ -137,6 +137,10 @@ impl LayoutElement for TestWindow {
         &self.id
     }
 
+    fn ipc_id(&self) -> u64 {
+        self.id as u64
+    }
+
     fn size(&self) -> Size<i32, Logical> {
         self.inner.borrow().size
     }

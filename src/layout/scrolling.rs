@@ -2417,6 +2417,122 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             })
     }
 
+    pub fn layout_tree(
+        &self,
+    ) -> (Vec<niri_ipc::WorkspaceColumn>, usize) {
+        let columns = self
+            .columns
+            .iter()
+            .map(|col| {
+                let windows = col
+                    .tiles
+                    .iter()
+                    .enumerate()
+                    .map(|(tile_idx, tile)| {
+                        let height = match col.data[tile_idx].height {
+                            WindowHeight::Auto { weight } => {
+                                niri_ipc::ColumnWindowHeight::Auto { weight }
+                            }
+                            WindowHeight::Fixed(h) => niri_ipc::ColumnWindowHeight::Fixed(h),
+                            WindowHeight::Preset(_) => {
+                                niri_ipc::ColumnWindowHeight::Auto { weight: 1.0 }
+                            }
+                        };
+                        niri_ipc::ColumnWindow {
+                            window_id: tile.window().ipc_id(),
+                            height,
+                        }
+                    })
+                    .collect();
+
+                let width = match col.width {
+                    ColumnWidth::Proportion(p) => niri_ipc::ColumnWidthLayout::Proportion(p),
+                    ColumnWidth::Fixed(f) => niri_ipc::ColumnWidthLayout::Fixed(f),
+                };
+
+                niri_ipc::WorkspaceColumn {
+                    windows,
+                    active_window_idx: col.active_tile_idx,
+                    width,
+                    is_full_width: col.is_full_width,
+                    display: col.display_mode,
+                }
+            })
+            .collect();
+
+        (columns, self.active_column_idx)
+    }
+
+    pub fn drain_tiles(&mut self) -> Vec<Tile<W>> {
+        self.interactive_resize = None;
+        self.activate_prev_column_on_removal = None;
+        self.view_offset_to_restore = None;
+        self.closing_windows.clear();
+
+        let mut tiles = Vec::new();
+        for col in self.columns.drain(..) {
+            tiles.extend(col.tiles);
+        }
+        self.data.clear();
+        tiles
+    }
+
+    pub fn rebuild_from_tiles(
+        &mut self,
+        tile_map: &mut std::collections::HashMap<u64, Tile<W>>,
+        columns: &[niri_ipc::WorkspaceColumn],
+        active_column_idx: usize,
+    ) {
+        for col_layout in columns {
+            let first = &col_layout.windows[0];
+            let tile = tile_map.remove(&first.window_id).unwrap();
+
+            let width = match col_layout.width {
+                niri_ipc::ColumnWidthLayout::Proportion(p) => ColumnWidth::Proportion(p),
+                niri_ipc::ColumnWidthLayout::Fixed(f) => ColumnWidth::Fixed(f),
+            };
+
+            let mut col = Column::new_with_tile(
+                tile,
+                self.view_size,
+                self.working_area,
+                self.parent_area,
+                self.scale,
+                width,
+                col_layout.is_full_width,
+            );
+
+            col.display_mode = col_layout.display;
+            col.data[0].height = to_window_height(first.height);
+
+            for tile_layout in col_layout.windows.iter().skip(1) {
+                let tile = tile_map.remove(&tile_layout.window_id).unwrap();
+                let idx = col.tiles.len();
+                col.add_tile_at(idx, tile);
+                let last = col.data.len() - 1;
+                col.data[last].height = to_window_height(tile_layout.height);
+            }
+
+            col.active_tile_idx = col_layout.active_window_idx.min(col.tiles.len() - 1);
+            col.update_tile_sizes(false);
+
+            self.data.push(ColumnData::new(&col));
+            self.columns.push(col);
+        }
+
+        self.active_column_idx = if self.columns.is_empty() {
+            0
+        } else {
+            active_column_idx.min(self.columns.len() - 1)
+        };
+
+        if !self.columns.is_empty() {
+            self.animate_view_offset_to_column(None, self.active_column_idx, None);
+        } else {
+            self.view_offset = ViewOffset::Static(0.);
+        }
+    }
+
     pub fn tiles_with_ipc_layouts(&self) -> impl Iterator<Item = (&Tile<W>, WindowLayout)> {
         self.columns
             .iter()
@@ -3915,6 +4031,13 @@ impl From<PresetSize> for ColumnWidth {
             PresetSize::Proportion(p) => Self::Proportion(p.clamp(0., 10000.)),
             PresetSize::Fixed(f) => Self::Fixed(f64::from(f.clamp(1, 100000))),
         }
+    }
+}
+
+fn to_window_height(h: niri_ipc::ColumnWindowHeight) -> WindowHeight {
+    match h {
+        niri_ipc::ColumnWindowHeight::Auto { weight } => WindowHeight::Auto { weight },
+        niri_ipc::ColumnWindowHeight::Fixed(h) => WindowHeight::Fixed(h),
     }
 }
 
