@@ -1643,6 +1643,11 @@ impl State {
                     self.niri.layout.toggle_window_height(Some(&window), false);
                 }
             }
+            Action::SetColumnScrollOffset(column, offset) => {
+                self.niri.layout.set_column_scroll_offset(column, offset as f64);
+                // FIXME: granular
+                self.niri.queue_redraw_all();
+            }
             Action::CenterColumn => {
                 self.niri.layout.center_column();
                 // FIXME: granular

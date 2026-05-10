@@ -2211,6 +2211,44 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         cancel_resize_for_column(&mut self.interactive_resize, col);
     }
 
+    pub fn set_column_scroll_offset(&mut self, column: usize, offset: f64) {
+        if self.columns.is_empty() {
+            return;
+        }
+
+        let col_idx = column.saturating_sub(1).min(self.columns.len() - 1);
+
+        // screen_x_of_column_left_edge = column_x(col_idx) - view_pos
+        // view_pos = column_x(active) + view_offset
+        // => new_view_offset = column_x(col_idx) - offset - column_x(active)
+        let new_view_offset =
+            self.column_x(col_idx) - offset - self.column_x(self.active_column_idx);
+
+        let config = self.options.animations.horizontal_view_movement.0;
+        let current = self.view_offset.current();
+        let pixel = 1. / self.scale;
+
+        if (new_view_offset - current).abs() < pixel {
+            self.view_offset.offset(new_view_offset - current);
+            return;
+        }
+
+        match &mut self.view_offset {
+            ViewOffset::Gesture(_) => {
+                self.view_offset = ViewOffset::Static(new_view_offset);
+            }
+            _ => {
+                self.view_offset = ViewOffset::Animation(Animation::new(
+                    self.clock.clone(),
+                    current,
+                    new_view_offset,
+                    0.,
+                    config,
+                ));
+            }
+        }
+    }
+
     pub fn center_window(&mut self, window: Option<&W::Id>) {
         if self.columns.is_empty() {
             return;

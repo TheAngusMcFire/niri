@@ -208,6 +208,12 @@ pub enum Action {
     SwapWindowRight,
     ToggleColumnTabbedDisplay,
     SetColumnDisplay(#[knuffel(argument, str)] ColumnDisplay),
+    SetColumnScrollOffset(
+        #[knuffel(argument)]
+        usize,
+        #[knuffel(argument)]
+        i32,
+    ),
     CenterColumn,
     CenterWindow,
     #[knuffel(skip)]
@@ -500,6 +506,9 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::SwapWindowLeft {} => Self::SwapWindowLeft,
             niri_ipc::Action::ToggleColumnTabbedDisplay {} => Self::ToggleColumnTabbedDisplay,
             niri_ipc::Action::SetColumnDisplay { display } => Self::SetColumnDisplay(display),
+            niri_ipc::Action::SetColumnScrollOffset { column, offset } => {
+                Self::SetColumnScrollOffset(column, offset.round() as i32)
+            }
             niri_ipc::Action::CenterColumn {} => Self::CenterColumn,
             niri_ipc::Action::CenterWindow { id: None } => Self::CenterWindow,
             niri_ipc::Action::CenterWindow { id: Some(id) } => Self::CenterWindowById(id),

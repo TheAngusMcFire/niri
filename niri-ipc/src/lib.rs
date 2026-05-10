@@ -552,6 +552,18 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg())]
         display: ColumnDisplay,
     },
+    /// Scroll the tiling layout so that a specific column's left edge is at a given offset from
+    /// the left edge of the working area.
+    ///
+    /// An offset of `0.0` with column `1` places the leftmost column flush against the left edge.
+    SetColumnScrollOffset {
+        /// 1-based index of the column to position. Clamped to the number of columns.
+        #[cfg_attr(feature = "clap", arg(long, default_value = "1"))]
+        column: usize,
+        /// Logical-pixel offset of the column's left edge from the working-area left edge.
+        #[cfg_attr(feature = "clap", arg(long, default_value = "0"))]
+        offset: f64,
+    },
     /// Center the focused column on the screen.
     CenterColumn {},
     /// Center a window on the screen.

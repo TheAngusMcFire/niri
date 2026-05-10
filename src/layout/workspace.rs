@@ -1157,6 +1157,10 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
+    pub fn set_column_scroll_offset(&mut self, column: usize, offset: f64) {
+        self.scrolling.set_column_scroll_offset(column, offset);
+    }
+
     pub fn center_window(&mut self, id: Option<&W::Id>) {
         if id.map_or(self.floating_is_active.get(), |id| {
             self.floating.has_window(id)

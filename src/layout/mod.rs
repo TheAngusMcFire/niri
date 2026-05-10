@@ -2249,6 +2249,13 @@ impl<W: LayoutElement> Layout<W> {
         workspace.center_column();
     }
 
+    pub fn set_column_scroll_offset(&mut self, column: usize, offset: f64) {
+        let Some(workspace) = self.active_workspace_mut() else {
+            return;
+        };
+        workspace.set_column_scroll_offset(column, offset);
+    }
+
 
     pub fn workspace_layout_tree(
         &self,
