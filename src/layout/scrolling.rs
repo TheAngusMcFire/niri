@@ -2240,11 +2240,20 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let col_idx = column.saturating_sub(1).min(self.columns.len() - 1);
 
+        // `offset` is measured from the column's natural left-aligned position,
+        // which is `working_area.left + gap` in screen coordinates.
+        //
         // screen_x_of_column_left_edge = column_x(col_idx) - view_pos
         // view_pos = column_x(active) + view_offset
-        // => new_view_offset = column_x(col_idx) - offset - column_x(active)
-        let new_view_offset =
-            self.column_x(col_idx) - offset - self.column_x(self.active_column_idx);
+        // We want: screen_x_of_column_left_edge = working_x + gap + offset
+        // => new_view_offset = column_x(col_idx) - column_x(active) - working_x - gap - offset
+        let working_x = self.working_area.loc.x;
+        let gap = self.options.layout.gaps;
+        let new_view_offset = self.column_x(col_idx)
+            - self.column_x(self.active_column_idx)
+            - working_x
+            - gap
+            - offset;
 
         let config = self.options.animations.horizontal_view_movement.0;
         let current = self.view_offset.current();

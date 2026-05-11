@@ -552,15 +552,19 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg())]
         display: ColumnDisplay,
     },
-    /// Scroll the tiling layout so that a specific column's left edge is at a given offset from
-    /// the left edge of the working area.
+    /// Scroll the tiling layout so that a specific column's left edge sits at a given offset
+    /// from its natural left-aligned position.
     ///
-    /// An offset of `0.0` with column `1` places the leftmost column flush against the left edge.
+    /// The natural position honours the configured layout gap, so `offset = 0.0` with `column = 1`
+    /// places the leftmost column one gap inside the working area's left edge — matching where
+    /// niri would normally render it when scrolled fully to the left. Positive offsets push the
+    /// column further to the right.
     SetColumnScrollOffset {
         /// 1-based index of the column to position. Clamped to the number of columns.
         #[cfg_attr(feature = "clap", arg(long, default_value = "1"))]
         column: usize,
-        /// Logical-pixel offset of the column's left edge from the working-area left edge.
+        /// Logical-pixel offset of the column's left edge from its natural left-aligned position
+        /// (working-area left edge plus one layout gap).
         #[cfg_attr(feature = "clap", arg(long, default_value = "0"))]
         offset: f64,
     },
