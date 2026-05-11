@@ -67,6 +67,14 @@ pub struct ScrollingSpace<W: LayoutElement> {
     /// View offset to restore after unfullscreening or unmaximizing.
     view_offset_to_restore: Option<f64>,
 
+    /// Absolute view position to pin across deferred window-commit updates.
+    ///
+    /// Set by `rebuild_from_tiles` to suppress the auto-scroll inside
+    /// `update_window` that would otherwise re-fit the active column when
+    /// asynchronous client commits arrive after `apply_layout_tree`. Cleared
+    /// by any user-initiated view-offset change (focus, scroll, gesture).
+    view_offset_pin: Option<f64>,
+
     /// Windows in the closing animation.
     closing_windows: Vec<ClosingWindow>,
 
@@ -300,6 +308,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             view_offset: ViewOffset::Static(0.),
             activate_prev_column_on_removal: None,
             view_offset_to_restore: None,
+            view_offset_pin: None,
             closing_windows: Vec::new(),
             view_size,
             working_area,
@@ -691,6 +700,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         new_view_offset: f64,
         config: niri_config::Animation,
     ) {
+        // Any deliberate view-offset animation supersedes a layout-apply pin.
+        self.view_offset_pin = None;
+
         let new_col_x = self.column_x(idx);
         let old_col_x = self.column_x(self.active_column_idx);
         let offset_delta = old_col_x - new_col_x;
@@ -1387,22 +1399,29 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             // We might need to move the view to ensure the resized window is still visible. But
             // only do it when the view isn't frozen by an interactive resize or a view gesture.
             if self.interactive_resize.is_none() && !self.view_offset.is_gesture() {
-                // Synchronize the horizontal view movement with the resize so that it looks nice.
-                // This is especially important for always-centered view.
-                let config = if ongoing_resize_anim {
-                    self.options.animations.window_resize.anim
+                if let Some(pinned) = self.view_offset_pin {
+                    // A recent apply_layout_tree pinned the view position; keep it pinned
+                    // across the deferred client commits and skip the auto-scroll.
+                    let offset = pinned - self.column_x(self.active_column_idx);
+                    self.view_offset = ViewOffset::Static(offset);
                 } else {
-                    self.options.animations.horizontal_view_movement.0
-                };
+                    // Synchronize the horizontal view movement with the resize so that it looks
+                    // nice. This is especially important for always-centered view.
+                    let config = if ongoing_resize_anim {
+                        self.options.animations.window_resize.anim
+                    } else {
+                        self.options.animations.horizontal_view_movement.0
+                    };
 
-                // Restore the view offset upon unfullscreening if needed.
-                if let Some(prev_offset) = unfullscreen_offset {
-                    self.animate_view_offset_with_config(col_idx, prev_offset, config);
+                    // Restore the view offset upon unfullscreening if needed.
+                    if let Some(prev_offset) = unfullscreen_offset {
+                        self.animate_view_offset_with_config(col_idx, prev_offset, config);
+                    }
+
+                    // FIXME: we will want to skip the animation in some cases here to make
+                    // continuously resizing windows not look janky.
+                    self.animate_view_offset_to_column_with_config(None, col_idx, None, config);
                 }
-
-                // FIXME: we will want to skip the animation in some cases here to make continuously
-                // resizing windows not look janky.
-                self.animate_view_offset_to_column_with_config(None, col_idx, None, config);
             }
         }
     }
@@ -2216,6 +2235,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
+        // Explicit scroll request supersedes a layout-apply pin.
+        self.view_offset_pin = None;
+
         let col_idx = column.saturating_sub(1).min(self.columns.len() - 1);
 
         // screen_x_of_column_left_edge = column_x(col_idx) - view_pos
@@ -2505,6 +2527,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.interactive_resize = None;
         self.activate_prev_column_on_removal = None;
         self.view_offset_to_restore = None;
+        self.view_offset_pin = None;
         self.closing_windows.clear();
 
         let mut tiles = Vec::new();
@@ -2570,8 +2593,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             // auto-scroll the workspace to fit the active column.
             let offset = target_view_pos - self.column_x(self.active_column_idx);
             self.view_offset = ViewOffset::Static(offset);
+            // Pin the position so deferred client commits from this rebuild
+            // don't re-trigger the auto-scroll inside `update_window`.
+            self.view_offset_pin = Some(target_view_pos);
         } else {
             self.view_offset = ViewOffset::Static(0.);
+            self.view_offset_pin = None;
         }
     }
 
@@ -3175,6 +3202,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         if self.interactive_resize.is_some() {
             return;
         }
+
+        // A gesture is a deliberate view change; it supersedes any layout-apply pin.
+        self.view_offset_pin = None;
 
         let gesture = ViewGesture {
             current_view_offset: self.view_offset.current(),
