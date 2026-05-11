@@ -1706,6 +1706,11 @@ impl<W: LayoutElement> Workspace<W> {
             }
         }
 
+        // Capture the scrolling view position before draining so we can restore
+        // it after the rebuild. Otherwise the rebuild would auto-scroll the
+        // workspace to fit the new active column into view, which is jarring.
+        let saved_view_pos = self.scrolling.view_pos();
+
         // Extract all tiles from both spaces into a flat map.
         let mut tile_map: HashMap<u64, Tile<W>> = HashMap::new();
         for tile in self.scrolling.drain_tiles() {
@@ -1716,8 +1721,12 @@ impl<W: LayoutElement> Workspace<W> {
         }
 
         // Rebuild from the submitted layout.
-        self.scrolling
-            .rebuild_from_tiles(&mut tile_map, &layout.columns, layout.active_column_idx);
+        self.scrolling.rebuild_from_tiles(
+            &mut tile_map,
+            &layout.columns,
+            layout.active_column_idx,
+            saved_view_pos,
+        );
         self.floating
             .rebuild_from_tiles(&mut tile_map, &layout.floating);
 

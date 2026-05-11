@@ -2520,6 +2520,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         tile_map: &mut std::collections::HashMap<u64, Tile<W>>,
         columns: &[niri_ipc::WorkspaceColumn],
         active_column_idx: usize,
+        target_view_pos: f64,
     ) {
         for col_layout in columns {
             let first = &col_layout.windows[0];
@@ -2565,7 +2566,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         };
 
         if !self.columns.is_empty() {
-            self.animate_view_offset_to_column(None, self.active_column_idx, None);
+            // Preserve the absolute view position so applying a layout does not
+            // auto-scroll the workspace to fit the active column.
+            let offset = target_view_pos - self.column_x(self.active_column_idx);
+            self.view_offset = ViewOffset::Static(offset);
         } else {
             self.view_offset = ViewOffset::Static(0.);
         }

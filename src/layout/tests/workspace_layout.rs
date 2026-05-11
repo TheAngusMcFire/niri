@@ -611,3 +611,55 @@ fn apply_layout_tree_empty_workspace_is_noop() {
     assert!(result.columns.is_empty());
     assert!(result.floating.is_empty());
 }
+
+fn view_pos(layout: &Layout<TestWindow>) -> f64 {
+    layout
+        .active_workspace()
+        .expect("active workspace")
+        .scrolling()
+        .view_pos()
+}
+
+#[test]
+fn apply_layout_tree_round_trip_preserves_view_pos() {
+    let mut layout = make_layout_with_output();
+    add_tiling(&mut layout, 1);
+    add_tiling(&mut layout, 2);
+    add_tiling(&mut layout, 3);
+
+    let before = view_pos(&layout);
+    let tree = get_tree(&layout);
+    apply_tree(&mut layout, tree);
+    let after = view_pos(&layout);
+
+    assert!(
+        (before - after).abs() < 1e-6,
+        "view_pos changed across round-trip: {before} -> {after}"
+    );
+}
+
+#[test]
+fn apply_layout_tree_change_active_column_preserves_view_pos() {
+    // When the submitted layout picks a different active column, niri must not
+    // auto-scroll the workspace to fit it — the scroll position should be the
+    // same as it was before the apply.
+    let mut layout = make_layout_with_output();
+    add_tiling(&mut layout, 1);
+    add_tiling(&mut layout, 2);
+    add_tiling(&mut layout, 3);
+    // Focus the leftmost column so view_pos is at the workspace origin.
+    Op::FocusColumnLeft.apply(&mut layout);
+    Op::FocusColumnLeft.apply(&mut layout);
+
+    let before = view_pos(&layout);
+
+    let mut tree = get_tree(&layout);
+    tree.active_column_idx = 2;
+    apply_tree(&mut layout, tree);
+
+    let after = view_pos(&layout);
+    assert!(
+        (before - after).abs() < 1e-6,
+        "view_pos changed when only the active column was reassigned: {before} -> {after}"
+    );
+}
