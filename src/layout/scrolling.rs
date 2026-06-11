@@ -1,4 +1,5 @@
 use std::cmp::{max, min};
+use std::collections::HashMap;
 use std::iter::{self, zip};
 use std::rc::Rc;
 use std::time::Duration;
@@ -67,13 +68,13 @@ pub struct ScrollingSpace<W: LayoutElement> {
     /// View offset to restore after unfullscreening or unmaximizing.
     view_offset_to_restore: Option<f64>,
 
-    /// Absolute view position to pin across deferred window-commit updates.
+    /// Whether the view position is currently managed externally.
     ///
-    /// Set by `rebuild_from_tiles` to suppress the auto-scroll inside
-    /// `update_window` that would otherwise re-fit the active column when
-    /// asynchronous client commits arrive after `apply_layout_tree`. Cleared
-    /// by any user-initiated view-offset change (focus, scroll, gesture).
-    view_offset_pin: Option<f64>,
+    /// Set by `apply_layout` and `set_column_scroll_offset` to suppress the auto-scroll
+    /// inside `update_window` that would otherwise re-fit the active column when client
+    /// commits arrive. Cleared by any user-initiated view change (focus, scroll, gesture,
+    /// interactive resize).
+    view_offset_pinned: bool,
 
     /// Windows in the closing animation.
     closing_windows: Vec<ClosingWindow>,
@@ -308,7 +309,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             view_offset: ViewOffset::Static(0.),
             activate_prev_column_on_removal: None,
             view_offset_to_restore: None,
-            view_offset_pin: None,
+            view_offset_pinned: false,
             closing_windows: Vec::new(),
             view_size,
             working_area,
@@ -700,8 +701,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         new_view_offset: f64,
         config: niri_config::Animation,
     ) {
-        // Any deliberate view-offset animation supersedes a layout-apply pin.
-        self.view_offset_pin = None;
+        // Any deliberate view-offset animation supersedes an external view pin.
+        self.view_offset_pinned = false;
 
         let new_col_x = self.column_x(idx);
         let old_col_x = self.column_x(self.active_column_idx);
@@ -1397,31 +1398,30 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             };
 
             // We might need to move the view to ensure the resized window is still visible. But
-            // only do it when the view isn't frozen by an interactive resize or a view gesture.
-            if self.interactive_resize.is_none() && !self.view_offset.is_gesture() {
-                if let Some(pinned) = self.view_offset_pin {
-                    // A recent apply_layout_tree pinned the view position; keep it pinned
-                    // across the deferred client commits and skip the auto-scroll.
-                    let offset = pinned - self.column_x(self.active_column_idx);
-                    self.view_offset = ViewOffset::Static(offset);
+            // only do it when the view isn't frozen by an interactive resize or a view gesture,
+            // and the view position isn't pinned by an external layout apply or scroll request.
+            // While pinned, the width-change compensation above already keeps the visual
+            // position stable, so leaving the view offset untouched is the right thing to do.
+            if self.interactive_resize.is_none()
+                && !self.view_offset.is_gesture()
+                && !self.view_offset_pinned
+            {
+                // Synchronize the horizontal view movement with the resize so that it looks nice.
+                // This is especially important for always-centered view.
+                let config = if ongoing_resize_anim {
+                    self.options.animations.window_resize.anim
                 } else {
-                    // Synchronize the horizontal view movement with the resize so that it looks
-                    // nice. This is especially important for always-centered view.
-                    let config = if ongoing_resize_anim {
-                        self.options.animations.window_resize.anim
-                    } else {
-                        self.options.animations.horizontal_view_movement.0
-                    };
+                    self.options.animations.horizontal_view_movement.0
+                };
 
-                    // Restore the view offset upon unfullscreening if needed.
-                    if let Some(prev_offset) = unfullscreen_offset {
-                        self.animate_view_offset_with_config(col_idx, prev_offset, config);
-                    }
-
-                    // FIXME: we will want to skip the animation in some cases here to make
-                    // continuously resizing windows not look janky.
-                    self.animate_view_offset_to_column_with_config(None, col_idx, None, config);
+                // Restore the view offset upon unfullscreening if needed.
+                if let Some(prev_offset) = unfullscreen_offset {
+                    self.animate_view_offset_with_config(col_idx, prev_offset, config);
                 }
+
+                // FIXME: we will want to skip the animation in some cases here to make
+                // continuously resizing windows not look janky.
+                self.animate_view_offset_to_column_with_config(None, col_idx, None, config);
             }
         }
     }
@@ -2235,10 +2235,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        // Explicit scroll request supersedes a layout-apply pin.
-        self.view_offset_pin = None;
-
         let col_idx = column.saturating_sub(1).min(self.columns.len() - 1);
+
+        // An explicitly requested scroll position means the view is managed externally; pin
+        // it so that client commits don't auto-scroll the view back to fit the active
+        // column.
+        self.view_offset_pinned = true;
 
         // `offset` is measured from the column's natural left-aligned position,
         // which is `working_area.left + gap` in screen coordinates.
@@ -2503,8 +2505,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                                 niri_ipc::ColumnWindowHeight::Auto { weight }
                             }
                             WindowHeight::Fixed(h) => niri_ipc::ColumnWindowHeight::Fixed(h),
+                            // Preset heights don't survive the round-trip; export the
+                            // current window height instead.
                             WindowHeight::Preset(_) => {
-                                niri_ipc::ColumnWindowHeight::Auto { weight: 1.0 }
+                                niri_ipc::ColumnWindowHeight::Fixed(tile.window_size().h)
                             }
                         };
                         niri_ipc::ColumnWindow {
@@ -2532,60 +2536,117 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         (columns, self.active_column_idx)
     }
 
-    pub fn drain_tiles(&mut self) -> Vec<Tile<W>> {
+    /// Returns the current visual position of every tile in workspace-view coordinates.
+    ///
+    /// Positions exclude the tiles' own render offsets (those travel with the tile and
+    /// compose with new move animations), but include the columns' render offsets (those
+    /// don't travel when a tile changes columns).
+    pub fn layout_positions_snapshot(
+        &self,
+    ) -> impl Iterator<Item = (u64, Point<f64, Logical>)> + '_ {
+        let view_pos = self.view_pos();
+        let col_xs = self.column_xs(self.data.iter().copied());
+        zip(&self.columns, col_xs).flat_map(move |(col, col_x)| {
+            let col_off = Point::from((col_x - view_pos, 0.)) + col.render_offset();
+            col.tiles()
+                .map(move |(tile, tile_off)| (tile.window().ipc_id(), col_off + tile_off))
+        })
+    }
+
+    /// Applies a submitted workspace layout to the scrolling space.
+    ///
+    /// Columns whose exact window sequence already exists are reused as-is, preserving
+    /// their animation and pending-sizing state and avoiding spurious configure requests.
+    /// The other columns are rebuilt from the remaining tiles plus `incoming` (tiles
+    /// moving in from the floating space). All resulting size requests share
+    /// `transaction` so the changes show up on screen in the same frame.
+    ///
+    /// Returns the tiles that are not part of the submitted tiling layout; they move to
+    /// the floating space.
+    pub fn apply_layout(
+        &mut self,
+        columns: &[niri_ipc::WorkspaceColumn],
+        active_column_idx: usize,
+        incoming: Vec<Tile<W>>,
+        old_positions: &HashMap<u64, Point<f64, Logical>>,
+        transaction: Transaction,
+    ) -> Vec<Tile<W>> {
         self.interactive_resize = None;
         self.activate_prev_column_on_removal = None;
         self.view_offset_to_restore = None;
-        self.view_offset_pin = None;
-        self.closing_windows.clear();
+        // Closing windows are deliberately left alone: in-flight close animations are
+        // independent from the column structure.
 
-        let mut tiles = Vec::new();
-        for col in self.columns.drain(..) {
-            tiles.extend(col.tiles);
-        }
+        let old_target_view_pos = self.target_view_pos();
+        let old_col_xs: Vec<f64> = self
+            .column_xs(self.data.iter().copied())
+            .take(self.columns.len())
+            .collect();
+
+        let old_columns: Vec<Column<W>> = self.columns.drain(..).collect();
         self.data.clear();
-        tiles
-    }
 
-    pub fn rebuild_from_tiles(
-        &mut self,
-        tile_map: &mut std::collections::HashMap<u64, Tile<W>>,
-        columns: &[niri_ipc::WorkspaceColumn],
-        active_column_idx: usize,
-        target_view_pos: f64,
-    ) {
+        // Match the submitted columns against the existing ones by their exact window
+        // sequence.
+        let old_ids: Vec<Vec<u64>> = old_columns
+            .iter()
+            .map(|col| {
+                col.tiles
+                    .iter()
+                    .map(|tile| tile.window().ipc_id())
+                    .collect()
+            })
+            .collect();
+        let mut claimed = vec![false; old_columns.len()];
+        let mut reuse: Vec<Option<usize>> = Vec::with_capacity(columns.len());
         for col_layout in columns {
-            let first = &col_layout.windows[0];
-            let tile = tile_map.remove(&first.window_id).unwrap();
-
-            let width = match col_layout.width {
-                niri_ipc::ColumnWidthLayout::Proportion(p) => ColumnWidth::Proportion(p),
-                niri_ipc::ColumnWidthLayout::Fixed(f) => ColumnWidth::Fixed(f),
-            };
-
-            let mut col = Column::new_with_tile(
-                tile,
-                self.view_size,
-                self.working_area,
-                self.parent_area,
-                self.scale,
-                width,
-                col_layout.is_full_width,
-            );
-
-            col.display_mode = col_layout.display;
-            col.data[0].height = to_window_height(first.height);
-
-            for tile_layout in col_layout.windows.iter().skip(1) {
-                let tile = tile_map.remove(&tile_layout.window_id).unwrap();
-                let idx = col.tiles.len();
-                col.add_tile_at(idx, tile);
-                let last = col.data.len() - 1;
-                col.data[last].height = to_window_height(tile_layout.height);
+            let ids: Vec<u64> = col_layout.windows.iter().map(|w| w.window_id).collect();
+            let found = old_ids
+                .iter()
+                .enumerate()
+                .find_map(|(idx, old)| (!claimed[idx] && *old == ids).then_some(idx));
+            if let Some(idx) = found {
+                claimed[idx] = true;
             }
+            reuse.push(found);
+        }
 
-            col.active_tile_idx = col_layout.active_window_idx.min(col.tiles.len() - 1);
-            col.update_tile_sizes(false);
+        // Tiles from disassembled columns and tiles entering from the floating space form
+        // the pool that the rebuilt columns draw from.
+        let mut kept: Vec<Option<Column<W>>> = Vec::with_capacity(old_columns.len());
+        let mut pool: HashMap<u64, Tile<W>> = HashMap::new();
+        for (claimed, col) in zip(claimed, old_columns) {
+            if claimed {
+                kept.push(Some(col));
+            } else {
+                for tile in col.tiles {
+                    pool.insert(tile.window().ipc_id(), tile);
+                }
+                kept.push(None);
+            }
+        }
+        for tile in incoming {
+            pool.insert(tile.window().ipc_id(), tile);
+        }
+
+        for (col_layout, reused_idx) in zip(columns, &reuse) {
+            let col = if let Some(idx) = *reused_idx {
+                let mut col = kept[idx].take().unwrap();
+                col.apply_layout(col_layout, transaction.clone());
+                col
+            } else {
+                let tiles = col_layout
+                    .windows
+                    .iter()
+                    .map(|win| {
+                        let tile = pool
+                            .remove(&win.window_id)
+                            .expect("validated layout references a missing window");
+                        (tile, to_window_height(win.height))
+                    })
+                    .collect();
+                self.build_column_for_layout(col_layout, tiles, transaction.clone())
+            };
 
             self.data.push(ColumnData::new(&col));
             self.columns.push(col);
@@ -2597,18 +2658,140 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             active_column_idx.min(self.columns.len() - 1)
         };
 
-        if !self.columns.is_empty() {
-            // Preserve the absolute view position so applying a layout does not
-            // auto-scroll the workspace to fit the active column.
-            let offset = target_view_pos - self.column_x(self.active_column_idx);
-            self.view_offset = ViewOffset::Static(offset);
-            // Pin the position so deferred client commits from this rebuild
-            // don't re-trigger the auto-scroll inside `update_window`.
-            self.view_offset_pin = Some(target_view_pos);
-        } else {
+        if self.columns.is_empty() {
             self.view_offset = ViewOffset::Static(0.);
-            self.view_offset_pin = None;
+            self.view_offset_pinned = false;
+            return pool.into_values().collect();
         }
+
+        // Preserve the absolute view position, including any in-progress animation or
+        // gesture, so applying a layout never scrolls the view by itself.
+        let new_target_view_pos = self.target_view_pos();
+        self.view_offset
+            .offset(old_target_view_pos - new_target_view_pos);
+
+        // Animate all windows from their previous visual positions.
+        let view_pos = self.view_pos();
+        let new_col_xs: Vec<f64> = self
+            .column_xs(self.data.iter().copied())
+            .take(self.columns.len())
+            .collect();
+        for ((col, reused_idx), new_col_x) in zip(zip(&mut self.columns, &reuse), &new_col_xs) {
+            if let Some(idx) = *reused_idx {
+                // Reused columns move as a whole; their tiles keep their own animations.
+                let delta = old_col_xs[idx] - *new_col_x;
+                if delta != 0. {
+                    col.animate_move_from(delta);
+                }
+            } else {
+                // Rebuilt columns animate each tile from its previous visual position.
+                let offsets: Vec<_> = col.tile_offsets().collect();
+                for (tile, tile_off) in zip(&mut col.tiles, offsets) {
+                    if let Some(old_pos) = old_positions.get(&tile.window().ipc_id()) {
+                        let new_pos = Point::from((*new_col_x - view_pos, 0.)) + tile_off;
+                        let delta = *old_pos - new_pos;
+                        if delta != Point::from((0., 0.)) {
+                            tile.animate_move_from(delta);
+                        }
+                    }
+                }
+            }
+        }
+
+        // The submitted layout dictates the view position; don't auto-scroll to fit the
+        // active column as the resize commits come in.
+        self.view_offset_pinned = true;
+
+        // Whatever is left in the pool moves to the floating space.
+        pool.into_values().collect()
+    }
+
+    /// Builds a column from scratch for [`Self::apply_layout`].
+    ///
+    /// In contrast to repeated `Column::add_tile_at()` calls, this requests new window
+    /// sizes exactly once, with animation and a shared transaction, and doesn't add any
+    /// intermediate move animations.
+    fn build_column_for_layout(
+        &self,
+        col_layout: &niri_ipc::WorkspaceColumn,
+        tiles: Vec<(Tile<W>, WindowHeight)>,
+        transaction: Transaction,
+    ) -> Column<W> {
+        let width = match col_layout.width {
+            niri_ipc::ColumnWidthLayout::Proportion(p) => ColumnWidth::Proportion(p),
+            niri_ipc::ColumnWidthLayout::Fixed(f) => ColumnWidth::Fixed(f),
+        };
+
+        // Match the width to a preset width, like Column::new_with_tile().
+        let preset_width_idx = self
+            .options
+            .layout
+            .preset_column_widths
+            .iter()
+            .position(|preset| width == ColumnWidth::from(*preset));
+
+        let single = tiles.len() == 1;
+        let pending_sizing_mode = if single {
+            tiles[0].0.window().pending_sizing_mode()
+        } else {
+            SizingMode::Normal
+        };
+
+        let mut col = Column {
+            tiles: Vec::with_capacity(tiles.len()),
+            data: Vec::with_capacity(tiles.len()),
+            active_tile_idx: 0,
+            width,
+            preset_width_idx,
+            is_full_width: col_layout.is_full_width,
+            is_pending_fullscreen: false,
+            is_pending_maximized: false,
+            display_mode: col_layout.display,
+            tab_indicator: TabIndicator::new(self.options.layout.tab_indicator),
+            move_animation: None,
+            view_size: self.view_size,
+            working_area: self.working_area,
+            parent_area: self.parent_area,
+            scale: self.scale,
+            clock: self.clock.clone(),
+            options: self.options.clone(),
+        };
+
+        for (mut tile, mut height) in tiles {
+            tile.update_config(self.view_size, self.scale, self.options.clone());
+            if single {
+                // The auto height weight must reset to 1 for a single window.
+                if let WindowHeight::Auto { .. } = height {
+                    height = WindowHeight::auto_1();
+                }
+            }
+            col.data.push(TileData::new(&tile, height));
+            col.tiles.push(tile);
+        }
+
+        col.active_tile_idx = col_layout.active_window_idx.min(col.tiles.len() - 1);
+
+        // Single-window columns keep their fullscreen or maximized state, like
+        // Column::new_with_tile(). Windows landing in multi-window columns are normalized
+        // back to normal sizing by the size requests below.
+        match pending_sizing_mode {
+            SizingMode::Normal => (),
+            SizingMode::Maximized => col.set_maximized(true),
+            SizingMode::Fullscreen => col.set_fullscreen(true),
+        }
+
+        col.update_tile_sizes_with_transaction(true, transaction);
+
+        // Animate the appearance of the tab indicator, like Column::new_with_tile().
+        if col.display_mode == ColumnDisplay::Tabbed
+            && !col.options.layout.tab_indicator.hide_when_single_tab
+            && col.sizing_mode().is_normal()
+        {
+            col.tab_indicator
+                .start_open_animation(col.clock.clone(), col.options.animations.window_movement.0);
+        }
+
+        col
     }
 
     pub fn tiles_with_ipc_layouts(&self) -> impl Iterator<Item = (&Tile<W>, WindowLayout)> {
@@ -3212,8 +3395,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        // A gesture is a deliberate view change; it supersedes any layout-apply pin.
-        self.view_offset_pin = None;
+        // A gesture is a deliberate view change; it supersedes any external view pin.
+        self.view_offset_pinned = false;
 
         let gesture = ViewGesture {
             current_view_offset: self.view_offset.current(),
@@ -3741,6 +3924,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         };
         self.interactive_resize = Some(resize);
 
+        // An interactive resize is a deliberate view interaction; it supersedes any
+        // external view pin.
+        self.view_offset_pinned = false;
+
         self.view_offset.stop_anim_and_gesture();
 
         true
@@ -4264,6 +4451,59 @@ impl<W: LayoutElement> Column<W> {
 
         if update_sizes {
             self.update_tile_sizes(false);
+        }
+    }
+
+    /// Applies the submitted properties of a column that was matched and reused by
+    /// [`ScrollingSpace::apply_layout`].
+    ///
+    /// The column's window sequence is guaranteed to be unchanged; only the width,
+    /// heights, display mode and active window may differ.
+    fn apply_layout(&mut self, col_layout: &niri_ipc::WorkspaceColumn, transaction: Transaction) {
+        let mut update_sizes = false;
+
+        let width = match col_layout.width {
+            niri_ipc::ColumnWidthLayout::Proportion(p) => ColumnWidth::Proportion(p),
+            niri_ipc::ColumnWidthLayout::Fixed(f) => ColumnWidth::Fixed(f),
+        };
+        if self.width != width {
+            self.preset_width_idx = self
+                .options
+                .layout
+                .preset_column_widths
+                .iter()
+                .position(|preset| width == ColumnWidth::from(*preset));
+            self.width = width;
+            update_sizes = true;
+        }
+
+        if self.is_full_width != col_layout.is_full_width {
+            self.is_full_width = col_layout.is_full_width;
+            update_sizes = true;
+        }
+
+        // This animates the display mode change and updates the tile sizes if needed.
+        self.set_column_display(col_layout.display);
+
+        let single = self.tiles.len() == 1;
+        for (data, win) in zip(&mut self.data, &col_layout.windows) {
+            let mut height = to_window_height(win.height);
+            if single {
+                // The auto height weight must reset to 1 for a single window.
+                if let WindowHeight::Auto { .. } = height {
+                    height = WindowHeight::auto_1();
+                }
+            }
+            if data.height != height {
+                data.height = height;
+                update_sizes = true;
+            }
+        }
+
+        self.activate_idx(col_layout.active_window_idx.min(self.tiles.len() - 1));
+
+        if update_sizes {
+            self.update_tile_sizes_with_transaction(true, transaction);
         }
     }
 

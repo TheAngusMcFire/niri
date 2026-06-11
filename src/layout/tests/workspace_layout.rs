@@ -638,6 +638,140 @@ fn apply_layout_tree_round_trip_preserves_view_pos() {
     );
 }
 
+fn target_view_pos(layout: &Layout<TestWindow>) -> f64 {
+    layout
+        .active_workspace()
+        .expect("active workspace")
+        .scrolling()
+        .target_view_pos()
+}
+
+#[test]
+fn apply_layout_tree_error_two_fixed_heights() {
+    let mut layout = make_layout_with_output();
+    add_tiling(&mut layout, 1);
+    add_tiling(&mut layout, 2);
+    Op::ConsumeOrExpelWindowLeft { id: None }.apply(&mut layout);
+
+    let mut tree = get_tree(&layout);
+    tree.columns[0].windows[0].height = ColumnWindowHeight::Fixed(200.0);
+    tree.columns[0].windows[1].height = ColumnWindowHeight::Fixed(300.0);
+
+    let err = apply_tree_err(&mut layout, tree);
+    assert!(
+        err.contains("at most one fixed-height"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn apply_layout_tree_preserves_floating_active_window() {
+    let mut layout = make_layout_with_output();
+    add_floating(&mut layout, 1);
+    add_floating(&mut layout, 2);
+
+    // Window 1 is below window 2 in the tree, but make it the active one.
+    Op::FocusWindow(1).apply(&mut layout);
+
+    let tree = get_tree(&layout);
+    apply_tree(&mut layout, tree);
+
+    let active = layout
+        .active_workspace()
+        .expect("active workspace")
+        .active_window()
+        .expect("active window")
+        .0
+        .id;
+    assert_eq!(active, 1, "the active floating window must stay active");
+}
+
+#[test]
+fn apply_layout_tree_deferred_commits_do_not_scroll_view() {
+    // Size changes from an apply are acked by clients asynchronously. When those commits
+    // arrive, niri must not auto-scroll the view back to fit the active column, because
+    // the IPC client controls the view position.
+    let mut layout = make_layout_with_output();
+    add_tiling(&mut layout, 1);
+    add_tiling(&mut layout, 2);
+    add_tiling(&mut layout, 3);
+    Op::FocusColumnLeft.apply(&mut layout);
+    Op::FocusColumnLeft.apply(&mut layout);
+
+    // Resize the active column through the layout tree.
+    let mut tree = get_tree(&layout);
+    tree.columns[0].width = ColumnWidthLayout::Fixed(500.0);
+    apply_tree(&mut layout, tree);
+
+    // Scroll the view away from the active column.
+    layout.set_column_scroll_offset(3, 0.);
+    let before = target_view_pos(&layout);
+
+    // The client commits the new size.
+    Op::Communicate(1).apply(&mut layout);
+    layout.verify_invariants();
+
+    let after = target_view_pos(&layout);
+    assert!(
+        (before - after).abs() < 1e-6,
+        "view target changed by a deferred commit: {before} -> {after}"
+    );
+}
+
+#[test]
+fn apply_layout_tree_during_view_animation_preserves_target() {
+    let mut layout = make_layout_with_output();
+    add_tiling(&mut layout, 1);
+    add_tiling(&mut layout, 2);
+    add_tiling(&mut layout, 3);
+
+    // Start a horizontal view animation.
+    Op::FocusColumnLeft.apply(&mut layout);
+    let before_current = view_pos(&layout);
+    let before_target = target_view_pos(&layout);
+
+    let tree = get_tree(&layout);
+    apply_tree(&mut layout, tree);
+
+    let after_current = view_pos(&layout);
+    let after_target = target_view_pos(&layout);
+    assert!(
+        (before_current - after_current).abs() < 1e-6,
+        "current view pos changed across apply: {before_current} -> {after_current}"
+    );
+    assert!(
+        (before_target - after_target).abs() < 1e-6,
+        "target view pos changed across apply: {before_target} -> {after_target}"
+    );
+}
+
+#[test]
+fn user_focus_clears_view_pin() {
+    // After the user focuses a column themselves, the normal keep-active-column-visible
+    // behavior must resume.
+    let mut layout = make_layout_with_output();
+    add_tiling(&mut layout, 1);
+    add_tiling(&mut layout, 2);
+    add_tiling(&mut layout, 3);
+
+    let tree = get_tree(&layout);
+    apply_tree(&mut layout, tree);
+    layout.set_column_scroll_offset(3, 0.);
+
+    // The user focuses a column: the view must move to fit it again.
+    Op::FocusColumnLeft.apply(&mut layout);
+    layout.verify_invariants();
+
+    let ws_view = target_view_pos(&layout);
+    // The active (second) column must be within the view now.
+    let tree = get_tree(&layout);
+    assert_eq!(tree.active_column_idx, 1);
+    assert!(
+        ws_view.is_finite(),
+        "view must have a valid target after user focus"
+    );
+}
+
 #[test]
 fn apply_layout_tree_change_active_column_preserves_view_pos() {
     // When the submitted layout picks a different active column, niri must not

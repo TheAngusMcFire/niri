@@ -1,4 +1,5 @@
 use std::cmp::max;
+use std::collections::HashMap;
 use std::iter::zip;
 use std::rc::Rc;
 
@@ -337,33 +338,98 @@ impl<W: LayoutElement> FloatingSpace<W> {
             .collect()
     }
 
-    pub fn drain_tiles(&mut self) -> Vec<Tile<W>> {
-        self.interactive_resize = None;
-        self.closing_windows.clear();
-        self.active_window_id = None;
-
-        let tiles: Vec<_> = self.tiles.drain(..).collect();
-        self.data.clear();
-        tiles
+    /// Returns the current position of every tile in workspace-view coordinates.
+    ///
+    /// Positions exclude the tiles' own render offsets; those travel with the tile and
+    /// compose with new move animations.
+    pub fn layout_positions_snapshot(
+        &self,
+    ) -> impl Iterator<Item = (u64, Point<f64, Logical>)> + '_ {
+        self.tiles_with_offsets()
+            .map(|(tile, offset)| (tile.window().ipc_id(), offset))
     }
 
-    pub fn rebuild_from_tiles(
+    /// Applies a submitted workspace layout to the floating space.
+    ///
+    /// Tiles already in the space keep their state and only get repositioned; `incoming`
+    /// tiles (moving in from the scrolling space) are sized like `add_tile()` would.
+    /// Every moved window is animated from its previous visual position in
+    /// `old_positions`.
+    pub fn apply_layout(
         &mut self,
-        tile_map: &mut std::collections::HashMap<u64, Tile<W>>,
         entries: &[niri_ipc::FloatingWindowEntry],
+        incoming: Vec<Tile<W>>,
+        old_positions: &HashMap<u64, Point<f64, Logical>>,
     ) {
+        self.interactive_resize = None;
+        // Closing windows are deliberately left alone: in-flight close animations are
+        // independent from the tile arrangement.
+
+        let old_active = self.active_window_id.take();
+
+        let mut pool: HashMap<u64, (Tile<W>, Option<Data>)> = HashMap::new();
+        for (tile, data) in zip(self.tiles.drain(..), self.data.drain(..)) {
+            pool.insert(tile.window().ipc_id(), (tile, Some(data)));
+        }
+        for tile in incoming {
+            pool.insert(tile.window().ipc_id(), (tile, None));
+        }
+
+        // The entries are in top-to-bottom stacking order.
         for entry in entries {
-            let mut tile = tile_map.remove(&entry.window_id).unwrap();
-            tile.update_config(self.view_size, self.scale, self.options.clone());
+            let (mut tile, data) = pool
+                .remove(&entry.window_id)
+                .expect("validated layout references a missing window");
+
             let pos = Point::from(entry.position);
-            let data = Data::new(self.working_area, &tile, pos);
+            let data = if let Some(mut data) = data {
+                data.set_logical_pos(pos);
+                data
+            } else {
+                // The tile is entering the floating space; size it like add_tile() does.
+                tile.update_config(self.view_size, self.scale, self.options.clone());
+
+                let floating_size = tile.floating_window_size;
+                let win = tile.window_mut();
+                let mut size = if !win.pending_sizing_mode().is_normal() {
+                    floating_size.unwrap_or_default()
+                } else {
+                    floating_size.unwrap_or_else(|| win.expected_size().unwrap_or_default())
+                };
+
+                let min_size = win.min_size();
+                let max_size = win.max_size();
+                size.w = ensure_min_max_size_maybe_zero(size.w, min_size.w, max_size.w);
+                size.h = ensure_min_max_size_maybe_zero(size.h, min_size.h, max_size.h);
+
+                win.request_size_once(size, true);
+
+                Data::new(self.working_area, &tile, pos)
+            };
+
+            // Animate the movement from the previous visual position.
+            if let Some(old_pos) = old_positions.get(&entry.window_id) {
+                let delta = *old_pos - data.logical_pos;
+                if delta != Point::from((0., 0.)) {
+                    tile.animate_move_from(delta);
+                }
+            }
+
             self.tiles.push(tile);
             self.data.push(data);
         }
 
-        if let Some(first) = self.tiles.first() {
-            self.active_window_id = Some(first.window().id().clone());
+        debug_assert!(pool.is_empty());
+
+        // The submitted order may violate the parent-child stacking invariant; fix it up.
+        for idx in 0..self.tiles.len() {
+            self.bring_up_descendants_of(idx);
         }
+
+        // Keep the previously active window when possible.
+        self.active_window_id = old_active
+            .filter(|id| self.contains(id))
+            .or_else(|| self.tiles.first().map(|tile| tile.window().id().clone()));
     }
 
     pub fn tiles_with_ipc_layouts(&self) -> impl Iterator<Item = (&Tile<W>, WindowLayout)> {

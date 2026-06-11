@@ -1651,6 +1651,7 @@ impl<W: LayoutElement> Workspace<W> {
                 }
                 _ => {}
             }
+            let mut fixed_heights = 0;
             for win in &col.windows {
                 if !seen_ids.insert(win.window_id) {
                     return Err(format!(
@@ -1678,8 +1679,12 @@ impl<W: LayoutElement> Workspace<W> {
                             win.window_id
                         ));
                     }
+                    niri_ipc::ColumnWindowHeight::Fixed(_) => fixed_heights += 1,
                     _ => {}
                 }
+            }
+            if fixed_heights > 1 {
+                return Err("a column can have at most one fixed-height window".into());
             }
         }
         for entry in &layout.floating {
@@ -1706,29 +1711,42 @@ impl<W: LayoutElement> Workspace<W> {
             }
         }
 
-        // Capture the scrolling view position before draining so we can restore
-        // it after the rebuild. Otherwise the rebuild would auto-scroll the
-        // workspace to fit the new active column into view, which is jarring.
-        let saved_view_pos = self.scrolling.view_pos();
+        // Snapshot the current visual positions of all tiles in workspace-view
+        // coordinates so the apply can animate every window from where it is now.
+        let mut old_positions: HashMap<u64, Point<f64, Logical>> = HashMap::new();
+        old_positions.extend(self.scrolling.layout_positions_snapshot());
+        old_positions.extend(self.floating.layout_positions_snapshot());
 
-        // Extract all tiles from both spaces into a flat map.
-        let mut tile_map: HashMap<u64, Tile<W>> = HashMap::new();
-        for tile in self.scrolling.drain_tiles() {
-            tile_map.insert(tile.window().ipc_id(), tile);
-        }
-        for tile in self.floating.drain_tiles() {
-            tile_map.insert(tile.window().ipc_id(), tile);
+        // Pull the tiles that move from floating to tiling out of the floating space.
+        let floating_ids: HashMap<u64, W::Id> = self
+            .floating
+            .tiles()
+            .map(|tile| (tile.window().ipc_id(), tile.window().id().clone()))
+            .collect();
+        let mut to_scrolling = Vec::new();
+        for col in &layout.columns {
+            for win in &col.windows {
+                if let Some(id) = floating_ids.get(&win.window_id) {
+                    to_scrolling.push(self.floating.remove_tile(id).tile);
+                }
+            }
         }
 
-        // Rebuild from the submitted layout.
-        self.scrolling.rebuild_from_tiles(
-            &mut tile_map,
+        // Use a single transaction so that all the resizes caused by this apply show up
+        // on screen in the same frame.
+        let transaction = Transaction::new();
+
+        // Restructure the scrolling space; tiles that move to floating come back out.
+        let to_floating = self.scrolling.apply_layout(
             &layout.columns,
             layout.active_column_idx,
-            saved_view_pos,
+            to_scrolling,
+            &old_positions,
+            transaction,
         );
+
         self.floating
-            .rebuild_from_tiles(&mut tile_map, &layout.floating);
+            .apply_layout(&layout.floating, to_floating, &old_positions);
 
         // Maintain the floating_is_active invariant after the rebuild.
         if self.floating.is_empty() {
